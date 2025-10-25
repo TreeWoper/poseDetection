@@ -1,0 +1,121 @@
+/* Global page style */
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  background: linear-gradient(135deg, #1a1a1a, #2b2b2b);
+  color: white;
+}
+
+/* Main container */
+.app-container {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 30px;
+  text-align: center;
+}
+
+/* Title */
+.app-title {
+  font-size: 3rem;
+  margin-bottom: 20px;
+  font-weight: bold;
+}
+
+/* Description */
+.app-description {
+  max-width: 600px;
+  font-size: 1.1rem;
+  line-height: 1.6;
+  margin-bottom: 40px;
+  color: #d0d0d0;
+}
+
+/* Buttons container */
+.button-container {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  width: 100%;
+  max-width: 300px;
+}
+
+/* Buttons */
+.upload-button,
+.demo-button {
+  padding: 15px;
+  font-size: 1.1rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  text-decoration: none;
+  text-align: center;
+  transition: background 0.3s, transform 0.2s;
+}
+
+/* Upload button style */
+.upload-button {
+  background-color: #007bff;
+  color: white;
+}
+
+.upload-button:hover {
+  background-color: #0069d9;
+  transform: scale(1.03);
+}
+
+/* Demo button style */
+.demo-button {
+  background-color: #28a745;
+  color: white;
+}
+
+.demo-button:hover {
+  background-color: #218838;
+  transform: scale(1.03);
+}
+
+/* Subpage styles */
+.page-container {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  background: linear-gradient(135deg, #1a1a1a, #2b2b2b);
+  color: white;
+  padding: 30px;
+  text-align: center;
+}
+
+.page-title {
+  font-size: 2.5rem;
+  margin-bottom: 20px;
+}
+
+.page-description {
+  max-width: 600px;
+  color: #d0d0d0;
+  margin-bottom: 40px;
+  font-size: 1.1rem;
+  line-height: 1.6;
+}
+
+/* Back button */
+.back-button {
+  display: inline-block;
+  padding: 12px 20px;
+  background-color: #555;
+  color: white;
+  text-decoration: none;
+  border-radius: 8px;
+  transition: background 0.3s, transform 0.2s;
+}
+
+.back-button:hover {
+  background-color: #777;
+  transform: scale(1.05);
+}
