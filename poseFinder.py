@@ -1,107 +1,265 @@
+#!/usr/bin/env python3
+"""
+compare_user_to_ideal.py (updated for 7-angle format)
+
+Usage:
+  python compare_user_to_ideal.py --ideal ideal_angles.npy --webcam
+  python compare_user_to_ideal.py --ideal ideal_angles.npy --video user.mp4
+
+Expects ideal .npy to be either:
+ - (3, 7) -> 3 key frames (Backswing, Impact, Mid) x 7 angles
+ - (T, 7) -> per-frame angles; script will pick 3 key rows automatically
+"""
+import argparse
+import json
+import time
+import os
+from collections import deque
+
 import cv2
 import mediapipe as mp
 import numpy as np
-from collections import deque
 
-# ---------------------------
-# Setup MediaPipe
-# ---------------------------
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
+# ---------- CONFIG ----------
+ANGLE_NAMES = ["L_Elbow","R_Elbow","L_Shoulder","R_Shoulder","L_Knee","R_Knee","Torso"]
+PHASE_NAMES = ["Backswing", "Impact", "MidSwing"]
+SMOOTH_WINDOW = 5
+TOLERANCE_DEG = 10
+MAX_DIFF_FOR_SCORE = 30.0
 
-pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.6, min_tracking_confidence=0.6)
-
-# ---------------------------
-# 3D Angle function
-# ---------------------------
+# ---------- HELPERS ----------
 def angle_3d(a, b, c):
-    a = np.array([a.x, a.y, a.z])
-    b = np.array([b.x, b.y, b.z])
-    c = np.array([c.x, c.y, c.z])
+    a = np.array([a.x, a.y, a.z], dtype=float)
+    b = np.array([b.x, b.y, b.z], dtype=float)
+    c = np.array([c.x, c.y, c.z], dtype=float)
     ba = a - b
     bc = c - b
-    cosang = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-    return np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0)))
+    denom = (np.linalg.norm(ba) * np.linalg.norm(bc))
+    if denom == 0:
+        return 0.0
+    cosang = np.dot(ba, bc) / denom
+    cosang = np.clip(cosang, -1.0, 1.0)
+    ang = float(np.degrees(np.arccos(cosang)))
+    if ang > 180:
+        ang = 360 - ang
+    return ang
 
-# ---------------------------
-# Ideal swing angles (example 3 key frames)
-# ---------------------------
-# For simplicity, we use one "frame" here, you can expand to multiple frames
-ideal_angles = {
-    "L_Elbow": 160,
-    "R_Elbow": 160,
-    "L_Shoulder": 45,
-    "R_Shoulder": 45,
-    "L_Knee": 175,
-    "R_Knee": 175,
-    "Torso": 40,
-}
+def compute_angles_from_world_landmarks(lm):
+    """
+    Return angles in the same order as ANGLE_NAMES:
+    L_Elbow, R_Elbow, L_Shoulder, R_Shoulder, L_Knee, R_Knee, Torso
+    """
+    try:
+        l_elbow = angle_3d(lm[11], lm[13], lm[15])        # shoulder-elbow-wrist
+        r_elbow = angle_3d(lm[12], lm[14], lm[16])
+        l_shoulder = angle_3d(lm[23], lm[11], lm[13])    # hip-shoulder-elbow
+        r_shoulder = angle_3d(lm[24], lm[12], lm[14])
+        l_knee = angle_3d(lm[23], lm[25], lm[27])        # hip-knee-ankle
+        r_knee = angle_3d(lm[24], lm[26], lm[28])
+        torso = angle_3d(lm[11], lm[23], lm[25])         # shoulder-hip-knee
+        return [l_elbow, r_elbow, l_shoulder, r_shoulder, l_knee, r_knee, torso]
+    except Exception:
+        return [0.0] * len(ANGLE_NAMES)
 
-tolerance = 10  # degrees
+def pick_key_indices_from_series(angle_matrix):
+    """Pick 3 key indices using left elbow column (col 0): argmax, argmin, mid"""
+    if angle_matrix.shape[0] < 3:
+        raise ValueError("Not enough frames to choose key indices")
+    left_elbow = angle_matrix[:, 0]
+    idx_top = int(np.argmax(left_elbow))
+    idx_impact = int(np.argmin(left_elbow))
+    idx_mid = int(len(left_elbow) // 2)
+    return [idx_top, idx_impact, idx_mid]
 
-# ---------------------------
-# Smoothing buffers
-# ---------------------------
-angle_history = {joint: deque(maxlen=5) for joint in ideal_angles.keys()}
+def smooth_matrix(mat, window=5):
+    if window <= 1:
+        return mat
+    sm = np.copy(mat)
+    for c in range(mat.shape[1]):
+        sm[:, c] = np.convolve(mat[:, c], np.ones(window)/window, mode='same')
+    return sm
 
-# ---------------------------
-# Capture
-# ---------------------------
-cap = cv2.VideoCapture(0)  #cap = cv2.VideoCapture(VIDEO_PATH)
+def compute_similarity_score(mean_abs_diff, max_diff=MAX_DIFF_FOR_SCORE):
+    score = max(0.0, 100.0 * (1.0 - (mean_abs_diff / max_diff)))
+    return float(score)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+# ---------- LOAD IDEAL ----------
+def load_ideal(ideal_path):
+    arr = np.load(ideal_path, allow_pickle=True)
+    if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+        raise ValueError("Ideal file must be a 2D numpy array (3x7 or Tx7).")
+    if arr.shape[1] != len(ANGLE_NAMES):
+        raise ValueError(f"Ideal file has {arr.shape[1]} columns but {len(ANGLE_NAMES)} angles expected.")
+    if arr.shape[0] == 3:
+        return arr.astype(float)
+    # else pick keys from per-frame series
+    idxs = pick_key_indices_from_series(arr)
+    return arr[idxs, :].astype(float)
 
-    frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(rgb)
-    image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+# ---------- EXTRACT USER ANGLES ----------
+def extract_user_angle_sequence_from_video(video_path_or_index, use_webcam=False, max_frames=None):
+    mp_pose = mp.solutions.pose
+    cap = cv2.VideoCapture(0) if use_webcam else cv2.VideoCapture(video_path_or_index)
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open capture: " + str(video_path_or_index))
+    pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    angles_list = []
+    frames = []
+    frame_idx = 0
+    print("Capturing frames and extracting angles (press 'q' to stop when using webcam)...")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if use_webcam:
+            frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+        if results.pose_world_landmarks:
+            lm = results.pose_world_landmarks.landmark
+            angles = compute_angles_from_world_landmarks(lm)
+            angles_list.append(angles)
+            frames.append(frame.copy())
+        if use_webcam:
+            display = frame.copy()
+            cv2.putText(display, f"Frames captured: {len(angles_list)}", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+            cv2.imshow("Position yourself (q to finish)", display)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        frame_idx += 1
+        if max_frames and frame_idx >= max_frames:
+            break
+        if use_webcam:
+            display = frame.copy()
+            if results.pose_landmarks:
+                mp.solutions.drawing_utils.draw_landmarks(
+                    display,
+                    results.pose_landmarks,
+                    mp.solutions.pose.POSE_CONNECTIONS)
+            cv2.putText(display, f"Frames captured: {len(angles_list)}", (20,40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+            cv2.imshow("Position yourself (q to finish)", display)
 
-    if results.pose_landmarks and results.pose_world_landmarks:
-        mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-        lm = results.pose_world_landmarks.landmark
+    pose.close()
+    cap.release()
+    if use_webcam:
+        cv2.destroyAllWindows()
+    if len(angles_list) == 0:
+        raise RuntimeError("No valid pose frames found.")
+    angle_matrix = np.array(angles_list, dtype=float)
+    return angle_matrix, frames
 
-        # ---------------------------
-        # Compute angles
-        # ---------------------------
-        angles = {}
-        angles["L_Elbow"] = angle_3d(lm[11], lm[13], lm[15])
-        angles["R_Elbow"] = angle_3d(lm[12], lm[14], lm[16])
-        angles["L_Shoulder"] = angle_3d(lm[23], lm[11], lm[13])  # hip-shoulder-elbow
-        angles["R_Shoulder"] = angle_3d(lm[24], lm[12], lm[14])
-        angles["L_Knee"] = angle_3d(lm[23], lm[25], lm[27])
-        angles["R_Knee"] = angle_3d(lm[24], lm[26], lm[28])
-        angles["Torso"] = angle_3d(lm[11], lm[23], lm[25])  # shoulder-hip-knee
+# ---------- COMPARE ----------
+def compare_keyframes(ideal_key_angles, user_key_angles):
+    results = {"phases": []}
+    per_phase_scores = []
+    for i, phase in enumerate(PHASE_NAMES):
+        ideal_vec = ideal_key_angles[i]
+        user_vec = user_key_angles[i]
+        diffs = np.abs(user_vec - ideal_vec)
+        mean_diff = float(np.mean(diffs))
+        score = compute_similarity_score(mean_diff)
+        per_joint = {}
+        for j, name in enumerate(ANGLE_NAMES):
+            d = float(diffs[j])
+            status = "Good" if d <= TOLERANCE_DEG else "Adjust"
+            per_joint[name] = {"diff_deg": d, "status": status}
+        results["phases"].append({
+            "phase": phase,
+            "mean_diff_deg": mean_diff,
+            "score_percent": score,
+            "per_joint": per_joint
+        })
+        per_phase_scores.append(score)
+    results["overall_score_percent"] = float(np.mean(per_phase_scores))
+    return results
 
-        # ---------------------------
-        # Smooth angles
-        # ---------------------------
-        for joint in angles:
-            angle_history[joint].append(angles[joint])
-            angles[joint] = np.mean(angle_history[joint])
+def overlay_feedback_on_frames(frames, user_key_idxs, results, out_dir=None):
+    """
+    frames: list of captured frames (only frames that had valid poses)
+    user_key_idxs: list of indices into frames for the selected key frames
+    results: output of compare_keyframes
+    Saves labeled images and displays them in separate windows.
+    Waits until a key is pressed to close all windows.
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True) if out_dir else None
+    saved = []
 
-        # ---------------------------
-        # Provide feedback
-        # ---------------------------
-        y_offset = 30
-        for joint, val in angles.items():
-            diff = abs(val - ideal_angles[joint])
-            color = (0, 255, 0) if diff <= tolerance else (0, 0, 255)
-            text = f"{joint}: {int(val)}°"
-            if diff > tolerance:
-                text += " <- Adjust"
-            cv2.putText(image, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            y_offset += 30
+    for i, idx in enumerate(user_key_idxs):
+        if idx < 0 or idx >= len(frames):
+            continue
+        img = frames[idx].copy()
+        phase = ["Backswing", "Impact", "MidSwing"][i]
+        info = results["phases"][i]
+        header = f"{phase} | Score: {int(info['score_percent'])}%"
+        cv2.putText(img, header, (20,50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3)
+        # list per-joint
+        y = 90
+        for name in ["L_Elbow", "R_Elbow", "Back"]:
+            pj = info["per_joint"][name]
+            color = (0,255,0) if pj["status"] == "Good" else (0,0,255)
+            cv2.putText(img, f"{name}: {int(pj['diff_deg'])}deg {pj['status']}", (20,y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+            y += 30
+        # show window for this key frame
+        window_name = f"{phase} comparison"
+        cv2.imshow(window_name, img)
+        # optionally save
+        if out_dir:
+            fname = os.path.join(out_dir, f"{phase}_comparison.png")
+            cv2.imwrite(fname, img)
+            saved.append(fname)
 
+    print("All key frames displayed. Press any key in any window to close.")
+    cv2.waitKey(0)  # wait indefinitely until a key is pressed
+    cv2.destroyAllWindows()
+    return saved
+
+
+# ---------- MAIN ----------
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--ideal", required=True, help="Path to ideal .npy (3x7 or Tx7)")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--webcam", action="store_true")
+    g.add_argument("--video", help="user video path")
+    p.add_argument("--outdir", default="compare_out", help="output folder")
+    p.add_argument("--max_frames", type=int, default=None)
+    args = p.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    print("Loading ideal from:", args.ideal)
+    ideal_key_angles = load_ideal(args.ideal)
+    print("Ideal key angles (3 x N):\n", ideal_key_angles)
+
+    if args.webcam:
+        user_matrix, frames = extract_user_angle_sequence_from_video(None, use_webcam=True, max_frames=args.max_frames)
     else:
-        cv2.putText(image, "No pose detected", (30, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        user_matrix, frames = extract_user_angle_sequence_from_video(args.video, use_webcam=False, max_frames=args.max_frames)
 
-    cv2.imshow("Golf Swing Assistant MVP", image)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    user_smoothed = smooth_matrix(user_matrix, window=SMOOTH_WINDOW)
+    user_key_idxs = pick_key_indices_from_series(user_smoothed)
+    print("User key indices:", user_key_idxs)
 
-cap.release()
-cv2.destroyAllWindows()
+    user_key_angles = np.array([user_smoothed[idx] for idx in user_key_idxs], dtype=float)
+    compare_results = compare_keyframes(ideal_key_angles, user_key_angles)
+    print("Comparison:\n", json.dumps(compare_results, indent=2))
+
+    saved_images = overlay_feedback_on_frames(frames, user_key_idxs, compare_results, out_dir=args.outdir)
+    summary = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ideal_path": os.path.abspath(args.ideal),
+        "user_source": "webcam" if args.webcam else os.path.abspath(args.video),
+        "user_key_indices_valid_frames": [int(i) for i in user_key_idxs],
+        "compare_results": compare_results,
+        "saved_images": saved_images
+    }
+    summary_path = os.path.join(args.outdir, "comparison_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print("Saved summary to:", summary_path)
+    print("Overall score:", compare_results["overall_score_percent"])
+
+if __name__ == "__main__":
+    main()
