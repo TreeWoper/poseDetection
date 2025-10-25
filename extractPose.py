@@ -8,12 +8,16 @@ pose = mp_pose.Pose(static_image_mode=False)
 VIDEO_PATH = "test_video.mp4"
 OUTPUT_FILE = "ideal_angles.npy"
 
-# omputes angle between 3 points
-def angle(a, b, c):
-    a, b, c = np.array(a), np.array(b), np.array(c)
-    ba, bc = a - b, c - b
+# computes angle between 3 points
+def angle_3d(a, b, c):
+    a = np.array([a.x, a.y, a.z])
+    b = np.array([b.x, b.y, b.z])
+    c = np.array([c.x, c.y, c.z])
+    ba = a - b
+    bc = c - b
     cosang = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
     return np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0)))
+
 
 # extract angles
 cap = cv2.VideoCapture(VIDEO_PATH)
@@ -30,15 +34,16 @@ while cap.isOpened():
     lm = results.pose_landmarks.landmark
     def pt(i): return [lm[i].x, lm[i].y]
 
-    # Key joints
-    L_SH, L_EL, L_WR = pt(11), pt(13), pt(15)
-    R_SH, R_EL, R_WR = pt(12), pt(14), pt(16)
-    L_HIP, L_KNEE, L_ANK = pt(23), pt(25), pt(27)
-
     # Compute representative angles
-    left_arm = angle(L_SH, L_EL, L_WR)
-    right_arm = angle(R_SH, R_EL, R_WR)
-    back = angle(L_SH, L_HIP, L_KNEE)
+    lm = results.pose_world_landmarks.landmark
+    L_SH, L_EL, L_WR = lm[11], lm[13], lm[15]
+    R_SH, R_EL, R_WR = lm[12], lm[14], lm[16]
+    L_HIP, L_KNEE, L_ANK = lm[23], lm[25], lm[27]
+
+    left_arm = angle_3d(L_SH, L_EL, L_WR)
+    right_arm = angle_3d(R_SH, R_EL, R_WR)
+    back = angle_3d(L_SH, L_HIP, L_KNEE)
+    
     arm_angle_series.append(left_arm)
 
     all_angles.append([left_arm, right_arm, back])
